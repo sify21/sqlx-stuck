@@ -4,7 +4,7 @@ use actix_web::{get, middleware, web, App, HttpServer};
 use chrono::Local;
 use dotenv::dotenv;
 use error::ServerError;
-use log::info;
+use log::{error, info};
 use rustls::internal::pemfile::{certs, pkcs8_private_keys};
 use rustls::{NoClientAuth, ServerConfig};
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -12,6 +12,8 @@ use std::io::Write;
 use std::time::Duration;
 use std::{env, thread};
 use tokio::runtime;
+use tokio::task;
+use tokio::time;
 
 pub type Result<T> = std::result::Result<T, error::ServerError>;
 
@@ -59,6 +61,9 @@ async fn main() -> std::io::Result<()> {
             .service(test)
             .service(nostuck)
             .service(stuck)
+            .service(nostuck2)
+            .service(stuck2)
+            .service(nostuck4)
     })
     .bind_rustls(
         format!(
@@ -77,26 +82,14 @@ async fn test() -> Result<&'static str> {
 }
 
 #[get("/nostuck")]
-async fn nostuck(app_state: web::Data<AppState>) -> Result<String> {
-    info!("nostuck start");
-    let mut tx = app_state.db_pool.begin().await?;
-    info!("nostuck tx ok");
-    let s: Vec<(i64, String)> = sqlx::query_as("select * from test where id <=2")
-        .fetch_all(&mut tx)
-        .await?;
-    info!("nostuck id<=2 is {}", s.len());
-    let r: Vec<(i64, String)> = sqlx::query_as("select * from test where id > 2")
-        .fetch_all(&mut tx)
-        .await?;
-    info!("nostuck id>2 is {}", r.len());
-    tx.commit().await?;
-    info!("nostuck end");
-    Ok(format!("id<=2 is {}, id>2 is {}", s.len(), r.len()))
+async fn nostuck(app_state: web::Data<AppState>) -> Result<&'static str> {
+    inner("nostuck", &app_state.db_pool).await?;
+    Ok("nostuck")
 }
 
 /// this will get stuck after being queried {DB_MAXCONN} times
 #[get("/stuck")]
-async fn stuck(app_state: web::Data<AppState>) -> Result<String> {
+async fn stuck(app_state: web::Data<AppState>) -> Result<&'static str> {
     let pool = app_state.db_pool.clone();
     let f =
         thread::Builder::new()
@@ -133,5 +126,145 @@ async fn stuck(app_state: web::Data<AppState>) -> Result<String> {
             _ => (),
         },
     }
-    Ok("stuck".to_string())
+    Ok("stuck")
+}
+
+#[get("/nostuck2")]
+async fn nostuck2(app_state: web::Data<AppState>) -> Result<&'static str> {
+    let pool = app_state.db_pool.clone();
+    let jh = task::spawn_local(async move {
+        match inner_withoutsleep("nostuck2", &pool).await {
+            Err(e) => error!("{:?}", &e),
+            Ok(()) => (),
+        }
+    });
+    match jh.await {
+        Ok(()) => (),
+        Err(e) => error!("{}", &e),
+    }
+    Ok("nostuck2")
+}
+
+/// this will get stuck after being queried {DB_MAXCONN} times
+#[get("/stuck2")]
+async fn stuck2(app_state: web::Data<AppState>) -> Result<&'static str> {
+    let pool = app_state.db_pool.clone();
+    let f = thread::Builder::new()
+        .name("stuck".to_string())
+        .spawn(move || {
+            runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(inner_withoutsleep("stuck2", &pool))
+        });
+    match f {
+        Err(_) => return Err(ServerError::Str("thread spawn error")),
+        Ok(jh) => match jh.join() {
+            Err(_) => return Err(ServerError::Str("thread join error")),
+            Ok(Err(e)) => return Err(ServerError::String(e.to_string())),
+            _ => (),
+        },
+    }
+    Ok("stuck2")
+}
+
+#[get("/nostuck3")]
+async fn nostuck3(app_state: web::Data<AppState>) -> Result<&'static str> {
+    let pool = app_state.db_pool.clone();
+    let f = thread::Builder::new()
+        .name("stuck".to_string())
+        .spawn(move || {
+            runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(inner("nostuck3", &pool))
+        });
+    match f {
+        Err(_) => return Err(ServerError::Str("thread spawn error")),
+        Ok(jh) => match jh.join() {
+            Err(_) => return Err(ServerError::Str("thread join error")),
+            Ok(Err(e)) => return Err(ServerError::String(e.to_string())),
+            _ => (),
+        },
+    }
+    Ok("stuck2")
+}
+
+#[get("/nostuck4")]
+async fn nostuck4(app_state: web::Data<AppState>) -> Result<&'static str> {
+    let pool = app_state.db_pool.clone();
+    let f =
+        thread::Builder::new()
+            .name("stuck".to_string())
+            .spawn(move || -> anyhow::Result<()> {
+                runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async move {
+                        info!("nostuck4 start");
+                        let mut tx = pool.begin().await?;
+                        info!("nostuck4 tx ok");
+                        let s: Vec<(i64, String)> =
+                            sqlx::query_as("select * from test where id <=2")
+                                .fetch_all(&mut tx)
+                                .await?;
+                        info!("nostuck4 id<=2 is {}", s.len());
+                        let s: Vec<(i64, String)> =
+                            sqlx::query_as("select * from test where id > 2")
+                                .fetch_all(&mut tx)
+                                .await?;
+                        info!("nostuck4 id>2 is {}", s.len());
+                        tx.commit().await?;
+                        time::sleep(Duration::from_secs(5)).await;
+                        info!("nostuck4 finish");
+                        Ok(())
+                    })
+            });
+    match f {
+        Err(_) => return Err(ServerError::Str("thread spawn error")),
+        Ok(jh) => match jh.join() {
+            Err(_) => return Err(ServerError::Str("thread join error")),
+            Ok(Err(e)) => return Err(ServerError::String(e.to_string())),
+            _ => (),
+        },
+    }
+    Ok("stuck")
+}
+
+async fn inner(name: &'static str, pool: &PgPool) -> Result<()> {
+    info!("{} start", &name);
+    let mut tx = pool.begin().await?;
+    info!("{} tx ok", &name);
+    let s: Vec<(i64, String)> = sqlx::query_as("select * from test where id <=2")
+        .fetch_all(&mut tx)
+        .await?;
+    info!("{} id<=2 is {}", &name, s.len());
+    let s: Vec<(i64, String)> = sqlx::query_as("select * from test where id > 2")
+        .fetch_all(&mut tx)
+        .await?;
+    info!("{} id>2 is {}", &name, s.len());
+    tx.commit().await?;
+    time::sleep(Duration::from_secs(5)).await;
+    info!("{} finish", &name);
+    Ok(())
+}
+
+async fn inner_withoutsleep(name: &'static str, pool: &PgPool) -> Result<()> {
+    info!("{} start", &name);
+    let mut tx = pool.begin().await?;
+    info!("{} tx ok", &name);
+    let s: Vec<(i64, String)> = sqlx::query_as("select * from test where id <=2")
+        .fetch_all(&mut tx)
+        .await?;
+    info!("{} id<=2 is {}", &name, s.len());
+    let s: Vec<(i64, String)> = sqlx::query_as("select * from test where id > 2")
+        .fetch_all(&mut tx)
+        .await?;
+    info!("{} id>2 is {}", &name, s.len());
+    tx.commit().await?;
+    info!("{} finish", &name);
+    Ok(())
 }
