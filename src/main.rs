@@ -23,6 +23,8 @@ struct AppState {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // todo 限制actix worker数目到2, 看看stuck
+    // join线程是什么情况。这个应该是actix的问题，不是pool封顶
     dotenv().unwrap();
     let pool = PgPoolOptions::new()
         .max_connections(env::var("DB_MAXCONN").map_or(10, |s| s.parse::<u32>().unwrap_or(10)))
